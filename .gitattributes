@@ -1,0 +1,7 @@
+# 统一按 LF 入库，避免 Windows 检出后 CI 上的 diff 噪音
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.wav binary
+*.ico binary

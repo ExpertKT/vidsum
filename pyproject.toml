@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vidsum"
+version = "0.1.0"
+description = "长视频 → 转写 + 分段摘要 + 手机可读报告。不需要 ffmpeg。"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "vidsum contributors" }]
+keywords = ["asr", "whisper", "summarization", "video", "cctv", "subtitle", "llm"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+  "faster-whisper>=1.0,<2.0",
+  "numpy>=1.24",
+  # PyAV 只用来解码 HLS / 媒体文件。注意：faster-whisper 1.2.x 自带的
+  # decode_audio() 会调用 av.open(..., metadata_errors=...)，而 PyAV 19 已删除该参数。
+  # vidsum 不走那条路（自己用 wave+numpy 解码），所以这里不锁版本。
+  "av>=12",
+]
+
+[project.optional-dependencies]
+nvidia = [
+  # Windows + NVIDIA 上想跑 GPU 才需要。pip 会把 DLL 放进
+  # site-packages/nvidia/*/bin，vidsum 会自动把它们挂进 DLL 搜索路径。
+  "nvidia-cublas-cu12",
+  "nvidia-cudnn-cu12",
+]
+dev = ["pytest>=8"]
+
+[project.scripts]
+vidsum = "vidsum.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ExpertKT/vidsum"
+
+[tool.setuptools]
+packages = ["vidsum"]
