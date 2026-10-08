@@ -1,4 +1,12 @@
-"""目标解析：把「CCTV 节目页 / 32 位 pid / 本地媒体文件」统一成 VideoSource。
+"""目标解析：把「任意视频链接 / CCTV 页 / 本地文件」统一成 VideoSource。
+
+四种来源，按这个顺序判定：
+
+1. **本地文件** —— 直接交给 PyAV。
+2. **直链媒体**（``.m3u8`` / ``.mp4`` / ``.m4a`` / ``.mp3`` …）—— 直接交给 PyAV。
+3. **CCTV 专线** —— 见下。只有它的接口能给出**官方分段**，是摘要骨架的最佳来源。
+4. **其它站点** —— 交给 yt-dlp（1800+ 站点：B站、YouTube 及大量国内站点），
+   顺带读它的 ``chapters``，YouTube 这类也能拿到章节骨架。
 
 CCTV 这条路上有两个必须记住的坑，都是实测踩出来的：
 
@@ -17,6 +25,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 VDN_API = "https://vdn.apps.cntv.cn/api/getHttpVideoInfo.do?pid={pid}"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -29,21 +38,41 @@ HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
 # 注意 manifest.audio_mp3 对部分视频是 404，所以放在最后兜底。
 AUDIO_FIRST = ("hls_audio_url", "audio_mp3")
 
+#: 这些后缀的 URL 当直链媒体，直接交给 PyAV，不绕 yt-dlp
+MEDIA_EXT = {
+    ".m3u8", ".mpd", ".mp4", ".mkv", ".webm", ".flv", ".ts", ".mov", ".avi", ".wmv",
+    ".m4a", ".m4v", ".mp3", ".aac", ".wav", ".flac", ".ogg", ".opus", ".wma",
+}
+
 
 class SourceError(RuntimeError):
     """目标不可用（链接失效、接口拒绝、guid 找不到等）。"""
+
+
+def looks_like_media(url: str) -> bool:
+    """URL 路径是不是以已知媒体后缀结尾（忽略查询串）。"""
+    try:
+        path = urlparse(url).path
+    except ValueError:
+        return False
+    dot = path.rfind(".")
+    if dot < 0:
+        return False
+    return path[dot:].lower() in MEDIA_EXT
 
 
 @dataclass
 class VideoSource:
     title: str
     duration_s: float
-    kind: str                                  # "cctv" | "local"
+    #: "local" | "direct" | "cctv" | "ytdlp"
+    kind: str
     page_url: str = ""
     pid: str = ""
-    # 播放地址候选（HLS/媒体 URL 或本地路径），按优先级排列
+    #: cctv / direct / local：可直接交给 PyAV 的地址（按优先级排列）。
+    #: ytdlp：仅作记录，实际由 ytdlp.download_audio() 下载。
     candidates: list[str] = field(default_factory=list)
-    # 官方分段 [{start, end, title}]，秒；本地文件为空
+    #: 分段 [{start, end, title}]，秒；CCTV 来自官方接口，yt-dlp 来自 chapters
     segments: list[dict] = field(default_factory=list)
 
     @property
@@ -52,9 +81,16 @@ class VideoSource:
 
 
 def http_get(url: str, timeout: int = 30) -> bytes:
+    from .net import proxy_hint
+
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        raise SourceError(f"请求 {url} 返回 HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise SourceError(f"请求 {url} 失败：{exc.reason}" + proxy_hint(exc)) from exc
 
 
 def _text(url: str, timeout: int = 30) -> str:
@@ -161,8 +197,42 @@ def resolve_local(path: str) -> VideoSource:
                        candidates=[str(p)])
 
 
-def resolve(target: str, timeout: int = 30) -> VideoSource:
-    """target 可以是 CCTV 节目页 URL、32 位 pid，或本地媒体文件。"""
+def resolve_direct(url: str) -> VideoSource:
+    """直链媒体（.m3u8 / .mp4 / .m4a …）：交给 PyAV 直接开，不过 yt-dlp。"""
+    name = unquote(Path(urlparse(url).path).name) or "video"
+    return VideoSource(title=name, duration_s=0.0, kind="direct",
+                       page_url=url, candidates=[url])
+
+
+def resolve_generic(url: str, timeout: int = 30,
+                    cookies_from_browser: str = "") -> VideoSource:
+    """其它站点：交给 yt-dlp 解析元数据，顺便捡它的 chapters 当摘要骨架。"""
+    from . import ytdlp
+
+    if not ytdlp.is_available():
+        raise SourceError(
+            "这个链接需要 yt-dlp 才能解析，但没装。\n"
+            "请执行：pip install yt-dlp"
+        )
+    info = ytdlp.probe(url, timeout=timeout,
+                       cookies_from_browser=cookies_from_browser)
+    return VideoSource(
+        title=info["title"],
+        duration_s=info["duration_s"],
+        kind="ytdlp",
+        page_url=info["webpage_url"] or url,
+        candidates=[url],
+        segments=info["segments"],
+    )
+
+
+def resolve(target: str, timeout: int = 30,
+            cookies_from_browser: str = "") -> VideoSource:
+    """统一入口。
+
+    target 可以是：本地媒体文件、直链媒体 URL（.m3u8/.mp4/.m4a…）、
+    CCTV 节目页 URL、32 位 CCTV pid、或任意 yt-dlp 支持的站点链接。
+    """
     if Path(target).exists():
         return resolve_local(target)
 
@@ -171,13 +241,19 @@ def resolve(target: str, timeout: int = 30) -> VideoSource:
         src.pid = target
         return src
 
-    if re.match(r"^https?://", target):
-        if "cctv" in target:
-            return resolve_cctv(target, timeout)
-        # 其他站点暂不解析页内 guid，交给调用方
-        raise SourceError(
-            "vidsum 目前只解析 CCTV 节目页、32 位 pid 和本地文件。\n"
-            "其他站点请先自行下载，再把本地文件路径传进来。"
-        )
+    if not re.match(r"^https?://", target):
+        raise SourceError(f"无法识别的目标：{target}")
 
-    raise SourceError(f"无法识别的目标：{target}")
+    # 直链媒体优先：CCTV 的 CDN 主机名里也含 cntv，不能靠域名判断
+    if looks_like_media(target):
+        return resolve_direct(target)
+
+    host = (urlparse(target).hostname or "").lower()
+    if "cctv" in host or "cntv" in host:
+        try:
+            return resolve_cctv(target, timeout)
+        except SourceError:
+            # 不是节目页（例如改版、或只是域名像），退回通用解析
+            pass
+
+    return resolve_generic(target, timeout, cookies_from_browser)

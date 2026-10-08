@@ -29,9 +29,19 @@ def _wav_seconds(wav: Path) -> float:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    from . import audio, asr, cards, sources, summarize
+    from . import audio, asr, cards, net, sources, summarize
     from .dashboard import Dashboard
     from .llm import load_config
+
+    if args.no_proxy:
+        cleared = net.disable_proxy()
+        print("  --no-proxy：" + ("已清掉 " + "，".join(cleared) if cleared
+                                  else "环境里本来就没有代理变量"))
+    else:
+        proxy = net.current_proxy()
+        if proxy and net.proxy_reachable(proxy) is False:
+            print(f"  [!] 环境里的代理 {proxy} 连不上。若下载失败，"
+                  f"试试加 --no-proxy。")
 
     out_root = Path(args.out).resolve()
     dash = Dashboard(host="127.0.0.1", port=args.port)
@@ -53,7 +63,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         # ── 1. 解析目标 ──
         dash.update("probe", 5, f"解析目标：{args.target}")
-        src = sources.resolve(args.target, timeout=args.timeout)
+        src = sources.resolve(args.target, timeout=args.timeout,
+                              cookies_from_browser=args.cookies_from_browser)
         outdir = Path(args.outdir) if args.outdir else out_root / slugify(
             src.pid or Path(src.title).stem, "video")
         outdir.mkdir(parents=True, exist_ok=True)
@@ -72,17 +83,30 @@ def cmd_run(args: argparse.Namespace) -> int:
         # ── 2. 音频 ──
         wav = outdir / "audio_16k.wav"
         limit = args.limit_seconds or 0
-        if src.kind == "cctv":
-            def audio_progress(_pct, detail):
-                dash.update("audio", min(95.0, _pct) if _pct else 0.0, detail)
+        reuse = not args.no_reuse
+
+        if src.kind == "ytdlp":
+            # 通用站点：交给 yt-dlp 把音轨下到本地，再走同一条 PyAV 解码
+            from . import ytdlp
+            media = ytdlp.download_audio(
+                src.page_url, outdir, timeout=args.timeout,
+                cookies_from_browser=args.cookies_from_browser,
+                on_progress=lambda p, d: dash.update("audio", p, d))
+            dash.update("audio", 97.0, f"下载完成：{media.name}，开始解码")
+            wav = audio.decode_to_wav(str(media), wav, rate=16000,
+                                      on_progress=lambda p, d: dash.update("audio", p, d),
+                                      reuse=reuse, limit_s=limit)
+        elif src.kind == "cctv":
+            # CCTV 常有多个 CDN 变体，逐个降级尝试
             wav, used = audio.decode_first(
-                src.candidates, wav, rate=16000, on_progress=audio_progress,
-                reuse=not args.no_reuse, limit_s=limit)
+                src.candidates, wav, rate=16000,
+                on_progress=lambda p, d: dash.update("audio", min(95.0, p) if p else 0.0, d),
+                reuse=reuse, limit_s=limit)
             print(f"  音频地址：{used[:100]}")
         else:
             wav = audio.decode_to_wav(src.candidates[0], wav, rate=16000,
                                       on_progress=lambda p, d: dash.update("audio", p, d),
-                                      reuse=not args.no_reuse, limit_s=limit)
+                                      reuse=reuse, limit_s=limit)
         dash.finish("audio", f"{wav.name} · {wav.stat().st_size / 1e6:.0f} MB")
 
         # ── 3. 转写 ──
@@ -112,7 +136,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                 duration_s=src.duration_s, transcript_path=transcript_path,
                 asr_label=f"faster-whisper {args.asr_model}",
                 on_progress=lambda p, d: dash.update("summary", p, d))
-            dash.finish("summary", f"{len(result['chapters'])} 段 + 全片总览")
+            if result.get("empty"):
+                dash.finish("summary", "没有语音内容，跳过摘要")
+                print("\n  [!] 没有识别到语音内容（纯音乐 / 无对白？），已跳过摘要。")
+                rc = 3
+            else:
+                dash.finish("summary", f"{len(result['chapters'])} 段 + 全片总览")
 
             if not args.no_report:
                 cards.render_report(
@@ -157,13 +186,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     for mod, hint in (("av", "pip install av"),
                       ("faster_whisper", "pip install faster-whisper"),
-                      ("numpy", "pip install numpy")):
+                      ("numpy", "pip install numpy"),
+                      ("yt_dlp", "pip install yt-dlp —— 不装就只能处理 CCTV 和直链")):
         try:
             m = importlib.import_module(mod)
-            print(f"  {mod:<15} {getattr(m, '__version__', '?')}")
+            ver = getattr(m, "__version__", "")
+            if not ver:                               # yt-dlp 的版本在 yt_dlp.version 里
+                ver = getattr(getattr(m, "version", None), "__version__", "?")
+            print(f"  {mod:<15} {ver}")
         except ImportError:
-            ok = False
-            print(f"  {mod:<15} X 缺失 —— {hint}")
+            if mod == "yt_dlp":
+                print(f"  {mod:<15} X 缺失 —— {hint}")
+            else:
+                ok = False
+                print(f"  {mod:<15} X 缺失 —— {hint}")
 
     try:
         from .asr import add_cuda_dll_dirs, pick_device
@@ -192,6 +228,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"  LLM             检查失败：{exc}")
         ok = False
 
+    from . import net
+    if args.no_proxy:
+        cleared = net.disable_proxy()
+        print("  代理            --no-proxy，已清掉：" +
+              ("，".join(cleared) if cleared else "（本来就没有）"))
+    else:
+        proxy = net.current_proxy()
+        state = net.proxy_reachable(proxy)
+        if state is None:
+            print("  代理            未设置（直连）")
+        elif state:
+            print(f"  代理            {proxy}（端口可达）")
+        else:
+            ok = False
+            print(f"  代理            X {proxy} 端口连不上！")
+            print("                  这会让所有联网请求失败。加 --no-proxy 重跑，")
+            print("                  或清掉 HTTPS_PROXY / HTTP_PROXY。")
+
     print("\n  " + ("[ok] 环境就绪" if ok else "[!] 有项目需要处理，见上面提示"))
     print("  提示：不需要 ffmpeg —— 音频解码走 PyAV。\n")
     return 0 if ok else 1
@@ -204,13 +258,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="跑完整流水线")
-    r.add_argument("target", help="CCTV 节目页 URL / 32 位 pid / 本地媒体文件")
+    r.add_argument("target", help="视频链接 / CCTV pid / 本地媒体文件")
     r.add_argument("--out", default="./vidsum-out", help="输出根目录（默认 ./vidsum-out）")
     r.add_argument("--outdir", default="", help="直接指定本次输出目录")
     r.add_argument("--asr-model", default="small",
                    help="faster-whisper 模型名或本地模型目录（默认 small）")
     r.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     r.add_argument("--language", default="zh")
+    r.add_argument("--cookies-from-browser", default="",
+                   help="从浏览器取 cookie，用于需要登录的站点"
+                        "（chrome / edge / firefox / chromium…）")
+    r.add_argument("--no-proxy", action="store_true",
+                   help="忽略环境里的 HTTP(S)_PROXY。环境里的代理挂了时用这个救急")
     r.add_argument("--port", type=int, default=8777, help="进度看板端口")
     r.add_argument("--no-dashboard", action="store_true", help="不开看板，只在终端打印进度")
     r.add_argument("--no-report", action="store_true", help="不生成 report.html")
@@ -221,6 +280,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.set_defaults(func=cmd_run)
 
     d = sub.add_parser("doctor", help="环境自检")
+    d.add_argument("--no-proxy", action="store_true",
+                   help="忽略环境里的 HTTP(S)_PROXY")
     d.set_defaults(func=cmd_doctor)
     return p
 

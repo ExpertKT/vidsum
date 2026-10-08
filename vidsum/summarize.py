@@ -90,13 +90,53 @@ def summarize_overview(cfg: LLMConfig, title: str, digest: str,
     return chat(cfg, [{"role": "user", "content": prompt}], max_tokens=OVERVIEW_TOKENS)
 
 
+def _empty_result(out_md: Path, title: str, total: float,
+                  transcript_path: Path | None, asr_label: str,
+                  on_progress: Progress | None) -> dict:
+    """没有任何语音内容时，**不要**调模型。
+
+    实测：把一段纯音乐 MV 喂进去，转写是 0 句，模型照样写出一千多字的「全片总览」——
+    镜头、风衣、键盘手、伴舞，全是从歌名和常识里编的。没有素材就不该产生摘要。
+    """
+    note = "（没有识别到任何语音内容——可能是纯音乐、纯环境声，或者音轨有问题。）"
+    lines = [
+        f"# {title or '视频'} — 未生成摘要",
+        "",
+        f"- 时长：{hhmmss(total)}（约 {total / 60:.0f} 分钟）",
+        "- 转写句数：0",
+        f"- ASR：{asr_label}",
+    ]
+    if transcript_path:
+        lines.append(f"- 完整转写稿：`{Path(transcript_path).name}`")
+    lines += [
+        "",
+        "## 说明",
+        "",
+        note,
+        "",
+        "vidsum 不会在没有任何素材的情况下调用模型——那样只会得到一段听起来很合理"
+        "但完全是编造的摘要。",
+    ]
+    text = "\n".join(lines)
+    Path(out_md).write_text(text, encoding="utf-8")
+    if on_progress:
+        on_progress(100, "没有语音内容，已跳过摘要")
+    return {"overview": note, "chapters": [], "markdown": text,
+            "total_s": total, "partial": False, "covered_s": 0.0, "empty": True}
+
+
 def summarize(cfg: LLMConfig, transcript: list[dict], chapters: list[dict],
               out_md: Path, title: str = "", duration_s: float = 0.0,
               transcript_path: Path | None = None,
               asr_label: str = "faster-whisper",
               on_progress: Progress | None = None) -> dict:
-    """返回 {overview, chapters:[{title,span,body}], markdown}"""
+    """返回 {overview, chapters:[{title,span,body}], markdown, partial, empty}"""
     total = duration_s or (transcript[-1]["end"] if transcript else 0.0)
+
+    spoken = [r for r in transcript if (r.get("text") or "").strip()]
+    if not spoken:
+        return _empty_result(out_md, title, total, transcript_path, asr_label, on_progress)
+
     if not chapters:
         chapters = fixed_chapters(total)
     buckets = bucket(transcript, chapters)

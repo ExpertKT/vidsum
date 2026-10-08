@@ -26,6 +26,8 @@ dependencies = [
   # decode_audio() 会调用 av.open(..., metadata_errors=...)，而 PyAV 19 已删除该参数。
   # vidsum 不走那条路（自己用 wave+numpy 解码），所以这里不锁版本。
   "av>=12",
+  # 通用站点解析（B站 / YouTube 及 1800+ 站点）。只处理 CCTV 和直链的话可以不装。
+  "yt-dlp>=2024.8",
 ]
 
 [project.optional-dependencies]
